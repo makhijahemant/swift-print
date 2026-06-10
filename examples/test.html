@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swift Print Test</title>
+<style>
+body{
+    font-family:Arial,sans-serif;
+    background:#f4f7fb;
+    color:#172033;
+    margin:0;
+    padding:40px;
+}
+main{
+    background:#fff;
+    border:1px solid #dde3ee;
+    border-radius:8px;
+    box-shadow:0 8px 24px rgba(20,30,50,.08);
+    max-width:460px;
+    padding:24px;
+}
+label{
+    display:block;
+    font-weight:700;
+    margin-top:16px;
+}
+input,select,textarea{
+    box-sizing:border-box;
+    width:100%;
+    padding:9px;
+    margin-top:6px;
+    border:1px solid #c8d1df;
+    border-radius:6px;
+    font:inherit;
+}
+button{
+    padding:10px 14px;
+    margin-top:12px;
+    background:#1769c2;
+    color:#fff;
+    border:0;
+    border-radius:6px;
+    cursor:pointer;
+    font-weight:700;
+}
+button:disabled{
+    background:#91a4bd;
+    cursor:not-allowed;
+}
+.status{
+    margin-top:12px;
+    font-weight:700;
+}
+hr{
+    border:0;
+    border-top:1px solid #dde3ee;
+    margin:22px 0;
+}
+</style>
+</head>
+<body>
+
+<main>
+<h1>Swift Print Test</h1>
+
+<label for="port">Port</label>
+<input id="port" value="1818">
+
+<label for="apiKey">Secret Token</label>
+<input id="apiKey" type="password" value="change-me">
+
+<button type="button" onclick="checkBridge()">Check Bridge</button>
+<div class="status" id="status"></div>
+
+<hr>
+
+<label for="printers">Available Printers</label>
+<select id="printers"></select>
+<button type="button" onclick="loadPrinters()">Load Printers</button>
+
+<hr>
+
+<label for="printText">Text to Print</label>
+<textarea id="printText" rows="5">Hello from Swift Print!</textarea>
+
+<button type="button" onclick="printNow()">Print</button>
+</main>
+
+<script>
+function apiKey() {
+    return document.getElementById("apiKey").value.trim();
+}
+
+function baseUrl() {
+    const port = document.getElementById("port").value.trim() || "1818";
+    return "http://127.0.0.1:" + port;
+}
+
+function setStatus(message, color) {
+    const el = document.getElementById("status");
+    el.innerText = message;
+    el.style.color = color || "#172033";
+}
+
+async function request(path, options) {
+    const response = await fetch(baseUrl() + path, {
+        ...options,
+        headers: {
+            "X-API-KEY": apiKey(),
+            ...(options && options.headers ? options.headers : {})
+        }
+    });
+
+    let data = {};
+    try {
+        data = await response.json();
+    } catch (_) {
+        data = {};
+    }
+
+    if (!response.ok) {
+        throw new Error(data.error || response.status + " " + response.statusText);
+    }
+
+    return data;
+}
+
+function textToBase64(text) {
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    bytes.forEach(byte => {
+        binary += String.fromCharCode(byte);
+    });
+    return btoa(binary);
+}
+
+async function checkBridge() {
+    try {
+        const result = await request("/");
+        setStatus("Bridge running on port " + result.port, "green");
+    } catch (error) {
+        setStatus("Bridge not running: " + error.message, "red");
+    }
+}
+
+async function loadPrinters() {
+    try {
+        const result = await request("/printers");
+        const printers = Array.isArray(result.printers) ? result.printers : [];
+        const select = document.getElementById("printers");
+        select.innerHTML = "";
+
+        printers.forEach(printer => {
+            const option = document.createElement("option");
+            option.value = printer;
+            option.textContent = printer;
+            select.appendChild(option);
+        });
+
+        setStatus(printers.length ? "Loaded " + printers.length + " printer(s)" : "No printers found", "green");
+    } catch (error) {
+        setStatus("Failed to load printers: " + error.message, "red");
+    }
+}
+
+async function printNow() {
+    const printer = document.getElementById("printers").value;
+    const text = document.getElementById("printText").value;
+
+    if (!printer) {
+        setStatus("Load and select a printer first", "red");
+        return;
+    }
+
+    try {
+        const result = await request("/print", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                printer: printer,
+                data: textToBase64(text + "\n")
+            })
+        });
+
+        setStatus(result.success ? "Print sent" : "Print failed: " + result.error, result.success ? "green" : "red");
+    } catch (error) {
+        setStatus("Print failed: " + error.message, "red");
+    }
+}
+</script>
+
+</body>
+</html>

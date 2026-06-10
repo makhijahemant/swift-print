@@ -1,0 +1,29 @@
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.syso
+**/*.syso
+dist/
+build/
+release/
+
+# Debug artifacts
+__debug_bin*
+
+# Local configuration and secrets
+config.json
+**/config.json
+*.local.json
+.env
+.env.*
+
+# Installer payload generated during release packaging
+cmd/swift-print-installer/payload/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+
+.vscode/
