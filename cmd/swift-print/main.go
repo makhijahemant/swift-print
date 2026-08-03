@@ -303,17 +303,20 @@ func printRawWindows(printerName string, data []byte) error {
 	// USB printer: direct device file (e.g. "USB001")
 	case strings.HasPrefix(upper, "USB"):
 		fmt.Printf("[PRINT] USB port (%s) — direct file\n", port)
-		return printViaFile(port, data)
+		return printViaSpooler(printerName, data)
+		// return printViaFile(port, data)
 
 	// Parallel port: direct device file (e.g. "LPT1")
 	case strings.HasPrefix(upper, "LPT"):
 		fmt.Printf("[PRINT] LPT port (%s) — direct file\n", port)
-		return printViaFile(port, data)
+		return printViaSpooler(printerName, data)
+		// return printViaFile(port, data)
 
 	// Serial port: direct device file (e.g. "COM3")
 	case strings.HasPrefix(upper, "COM"):
 		fmt.Printf("[PRINT] COM port (%s) — direct file\n", port)
-		return printViaFile(port, data)
+		return printViaSpooler(printerName, data)
+		// return printViaFile(port, data)
 
 	// Unknown port type: let the spooler handle it
 	default:
