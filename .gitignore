@@ -19,9 +19,6 @@ config.json
 .env
 .env.*
 
-# Installer payload generated during release packaging
-cmd/swift-print-installer/payload/
-
 # Editor and OS noise
 .DS_Store
 Thumbs.db

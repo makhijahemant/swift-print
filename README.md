@@ -15,7 +15,7 @@ that need a simple local print bridge.
 - Raw print support for TCP, USB, LPT, COM, and spooler fallback paths
 - Printer discovery from the Windows registry
 - Simple settings page for port and token changes
-- Optional single-file installer build
+- Standard Windows installer with uninstaller (Inno Setup)
 - Useful for browser printing, POS printing, receipt printing, and local print bridge integrations
 
 ## Project Layout
@@ -23,13 +23,10 @@ that need a simple local print bridge.
 ```text
 cmd/
   swift-print/             Main tray app and local print server
-  swift-print-installer/   Installer command
+installer/swift-print.iss  Inno Setup installer script
 examples/test.html         Browser smoke-test page
 config.example.json        Example runtime config
 ```
-
-The old local project folders are ignored so this repository can be published
-without generated binaries, debug builds, or private config files.
 
 ## Security Notes
 
@@ -50,40 +47,69 @@ port `1818` and token `change-me`.
 Swift Print is a Windows app. If you build from Linux or macOS, set
 `GOOS=windows GOARCH=amd64` as shown below.
 
-First install `rsrc` and generate the Windows icon resources. Do this before building so the generated `rsrc.syso` files are included in the executables:
+First install `goversioninfo` and generate the Windows resources (icon, version
+info and manifest). Do this before building so the generated `resource.syso` is
+included in the executable:
 
 ```bash
-go install github.com/akavel/rsrc@latest
+go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
 mkdir -p dist
-rsrc -ico cmd/swift-print/swiftprint.ico -arch amd64 -o cmd/swift-print/rsrc.syso
-rsrc -ico cmd/swift-print-installer/swiftprint.ico -arch amd64 -o cmd/swift-print-installer/rsrc.syso
+cd cmd/swift-print && goversioninfo -64 -o resource.syso versioninfo.json && cd ../..
 ```
 
-After the icon resources are generated, build from Windows with:
+Then build the app:
 
 ```bash
-go build -ldflags "-H=windowsgui" -o "dist/Swift Print.exe" ./cmd/swift-print
-go build -o "dist/Swift Print Installer.exe" ./cmd/swift-print-installer
+go build -trimpath -ldflags "-H=windowsgui" -o "dist/Swift Print.exe" ./cmd/swift-print
 ```
 
 If you are building from Linux or macOS, cross-build with:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -ldflags "-H=windowsgui" -o "dist/Swift Print.exe" ./cmd/swift-print
-GOOS=windows GOARCH=amd64 go build -o "dist/Swift Print Installer.exe" ./cmd/swift-print-installer
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H=windowsgui" -o "dist/Swift Print.exe" ./cmd/swift-print
 ```
 
-## Single-File Installer Release
+Do not pack or obfuscate the executable (UPX, garble, etc.). Packed binaries are
+much more likely to be flagged by antivirus software.
 
-To embed the app and config inside the installer, place release payload files in:
+## Installer
 
-```text
-cmd/swift-print-installer/payload/Swift Print.exe
-cmd/swift-print-installer/payload/config.json
+The installer is built with [Inno Setup 7.1.0](https://jrsoftware.org/isinfo.php)
+on Windows. After building `dist/Swift Print.exe`, run from the repository root:
+
+```bash
+iscc installer/swift-print.iss
+iscc /DAppVersion=1.2.3 installer/swift-print.iss
 ```
 
-Then build the installer command. The payload files are ignored by Git, but Go
-will embed them into the installer binary when they exist at build time.
+This produces `dist/Swift Print Setup.exe`.
+
+The installer:
+
+- installs per user to `%LOCALAPPDATA%\Programs\Swift Print` (no admin prompt)
+- adds Swift Print to Windows startup and the Start Menu
+- keeps the existing `config.json` on upgrade
+- registers an uninstaller in Settings > Apps (and Control Panel > Programs)
+
+If you installed an earlier version of Swift Print in `C:\Swift Print`, quit it
+from the tray and delete that folder manually. Copy `config.json` to the new
+install folder first if you want to keep your port and token.
+
+## Uninstall
+
+Open Settings > Apps > Installed apps (or Control Panel > Programs and
+Features), select Swift Print, and choose Uninstall. This stops the app and
+removes its files, its config, the startup entry and the Start Menu shortcuts.
+
+## Antivirus and SmartScreen Warnings
+
+Swift Print releases are not code signed yet, so Windows SmartScreen may show
+"Windows protected your PC" when you run the installer. Click **More info** and
+then **Run anyway**.
+
+Download Swift Print only from this repository's GitHub Releases page. If
+Microsoft Defender flags the installer, it is a false positive caused by the
+missing signature; please open an issue so it can be reported.
 
 ## Runtime Config
 
@@ -130,14 +156,15 @@ X-API-KEY: your-secret-token
 }
 ```
 
-Browser smoke test:
+Smoke test:
 
-```text
-examples/test.html
-```
+The settings page (tray menu > Open Settings) has a built-in Test Print
+section. It loads the installed printers and sends a small test print using the
+saved port and token.
 
-Open the file in a browser, enter the Swift Print port and secret token, then
-load printers or send a small test print.
+To test from a separate web page, as your own app would call the bridge, open
+`examples/test.html` in a browser, enter the Swift Print port and secret token,
+then load printers or send a small test print.
 
 ## License
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -208,39 +209,8 @@ func printViaTCP(hostport string, data []byte) error {
 	return nil
 }
 
-// printViaFile opens a Windows device port (USB001, LPT1, COM3, etc.) directly
-// using CreateFile and writes raw bytes, bypassing the print spooler entirely.
-func printViaFile(portName string, data []byte) error {
-	path := `\\.\` + portName
-	pathPtr, _ := syscall.UTF16PtrFromString(path)
-
-	handle, err := syscall.CreateFile(
-		pathPtr,
-		syscall.GENERIC_WRITE,
-		0,
-		nil,
-		syscall.OPEN_EXISTING,
-		syscall.FILE_ATTRIBUTE_NORMAL,
-		0,
-	)
-	if err != nil {
-		return fmt.Errorf("CreateFile(%s): %w", path, err)
-	}
-	defer syscall.CloseHandle(handle)
-
-	var written uint32
-	if err := syscall.WriteFile(handle, data, &written, nil); err != nil {
-		return fmt.Errorf("WriteFile(%s): %w", path, err)
-	}
-	if written != uint32(len(data)) {
-		return fmt.Errorf("%s: only wrote %d of %d bytes", path, written, len(data))
-	}
-	fmt.Printf("[PRINT] File direct: sent %d bytes to %s\n", written, path)
-	return nil
-}
-
 // printViaSpooler sends raw bytes through the Windows print spooler.
-// Last-resort fallback for port types we don't handle directly.
+// Used for every port type other than a TCP host:port.
 func printViaSpooler(printerName string, data []byte) error {
 	var handle syscall.Handle
 	namePtr, _ := syscall.UTF16PtrFromString(printerName)
@@ -292,37 +262,26 @@ func printRawWindows(printerName string, data []byte) error {
 		return printViaSpooler(printerName, data)
 	}
 
-	upper := strings.ToUpper(strings.TrimSpace(port))
-
-	switch {
-	// Network printer: TCP direct socket (e.g. "127.0.0.1:9100")
-	case func() bool { _, _, e := net.SplitHostPort(port); return e == nil }():
+	// Network printer (e.g. "127.0.0.1:9100"): send straight to the socket.
+	if isTCPPort(port) {
 		fmt.Printf("[PRINT] TCP port (%s) — direct socket\n", port)
 		return printViaTCP(port, data)
-
-	// USB printer: direct device file (e.g. "USB001")
-	case strings.HasPrefix(upper, "USB"):
-		fmt.Printf("[PRINT] USB port (%s) — direct file\n", port)
-		return printViaSpooler(printerName, data)
-		// return printViaFile(port, data)
-
-	// Parallel port: direct device file (e.g. "LPT1")
-	case strings.HasPrefix(upper, "LPT"):
-		fmt.Printf("[PRINT] LPT port (%s) — direct file\n", port)
-		return printViaSpooler(printerName, data)
-		// return printViaFile(port, data)
-
-	// Serial port: direct device file (e.g. "COM3")
-	case strings.HasPrefix(upper, "COM"):
-		fmt.Printf("[PRINT] COM port (%s) — direct file\n", port)
-		return printViaSpooler(printerName, data)
-		// return printViaFile(port, data)
-
-	// Unknown port type: let the spooler handle it
-	default:
-		fmt.Printf("[PRINT] Unknown port type (%s) — falling back to spooler\n", port)
-		return printViaSpooler(printerName, data)
 	}
+
+	// USB, LPT, COM, PDF/file ports and anything else go through the spooler.
+	fmt.Printf("[PRINT] Port %s — spooler\n", port)
+	return printViaSpooler(printerName, data)
+}
+
+// isTCPPort reports whether port is a network address like "192.168.1.50:9100".
+// Ports like "PORTPROMPT:" (Print to PDF), "FILE:", "COM1:" or "C:\out.pdf" also
+// contain a colon, so a non-empty host and a numeric port are both required.
+func isTCPPort(port string) bool {
+	host, portNumber, err := net.SplitHostPort(strings.TrimSpace(port))
+	if err != nil || host == "" {
+		return false
+	}
+	return validatePort(portNumber) == nil
 }
 
 func getPrintersFromRegistry() ([]string, error) {
@@ -399,9 +358,10 @@ func uniqueStrings(values []string) []string {
 // AUTH
 //////////////////////////////////////////////////////////////
 
-func checkAPIKey(r *http.Request) bool {
+// tokenMatches reports whether given equals the configured secret token (constant time).
+func tokenMatches(given string) bool {
 	expected := []byte(config.SecretToken)
-	actual := []byte(r.Header.Get("X-API-KEY"))
+	actual := []byte(given)
 	return len(expected) == len(actual) && subtle.ConstantTimeCompare(expected, actual) == 1
 }
 
@@ -409,22 +369,29 @@ func checkAPIKey(r *http.Request) bool {
 // HTTP ENDPOINTS
 //////////////////////////////////////////////////////////////
 
-func printHandler(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	setAPIHeaders(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
+// apiHandler adds the checks every API endpoint shares: headers, CORS preflight,
+// the allowed method (empty means any) and, if requireKey is set, the X-API-KEY header.
+func apiHandler(method string, requireKey bool, handle http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		setSecurityHeaders(w)
+		setAPIHeaders(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if method != "" && r.Method != method {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if requireKey && !tokenMatches(r.Header.Get("X-API-KEY")) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		handle(w, r)
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !checkAPIKey(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+}
 
+func printHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxPrintBodyBytes)
 	body, _ := io.ReadAll(r.Body)
 	var req PrintRequest
@@ -448,21 +415,6 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func printersHandler(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	setAPIHeaders(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !checkAPIKey(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	printers, err := getPrintersFromRegistry()
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":  err == nil,
@@ -472,12 +424,6 @@ func printersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func testHandler(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	setAPIHeaders(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"status": "running",
 		"port":   config.Port,
@@ -486,48 +432,88 @@ func testHandler(w http.ResponseWriter, r *http.Request) {
 
 func settingsHandler(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	switch r.Method {
-	case http.MethodGet:
-		settingsTemplate.Execute(w, config)
-	case http.MethodPost:
-		if !isSameOriginSettingsRequest(r) {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "Invalid form", http.StatusBadRequest)
-			return
-		}
-		if !checkCurrentSettingsToken(r) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	// The browser must send a real Origin on the form POST for the same-origin check.
+	w.Header().Set("Referrer-Policy", "same-origin")
 
-		next := config
-		next.Port = strings.TrimSpace(r.FormValue("port"))
-		next.SecretToken = strings.TrimSpace(r.FormValue("secret_token"))
-
-		if err := validatePort(next.Port); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if next.SecretToken == "" {
-			http.Error(w, "Secret token is required", http.StatusBadRequest)
-			return
-		}
-		if len(next.SecretToken) > 256 {
-			http.Error(w, "Secret token must be 256 characters or fewer", http.StatusBadRequest)
-			return
-		}
-		if err := saveConfig(next); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		config = next
-		settingsTemplate.Execute(w, config)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method == http.MethodGet {
+		settingsTemplate.Execute(w, settingsPage{AppConfig: config})
+		return
 	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !isSameOriginSettingsRequest(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	err := r.ParseForm()
+	if err != nil {
+		http.Error(w, "Invalid form", http.StatusBadRequest)
+		return
+	}
+	if !tokenMatches(r.FormValue("current_secret_token")) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	next := AppConfig{
+		Port:        strings.TrimSpace(r.FormValue("port")),
+		SecretToken: strings.TrimSpace(r.FormValue("secret_token")),
+	}
+	err = validateSettings(next)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Open the new port before saving, so a busy port leaves everything unchanged.
+	portChanged := next.Port != config.Port
+	var newListener net.Listener
+	if portChanged {
+		newListener, err = net.Listen("tcp", "127.0.0.1:"+next.Port)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Port %s is not available: %v", next.Port, err), http.StatusBadRequest)
+			return
+		}
+	}
+
+	err = saveConfig(next)
+	if err != nil {
+		if newListener != nil {
+			newListener.Close()
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	config = next
+
+	if !portChanged {
+		settingsTemplate.Execute(w, settingsPage{AppConfig: config})
+		return
+	}
+
+	startServing(newListener)
+	systray.SetTooltip(appName + " running on port " + config.Port)
+	settingsTemplate.Execute(w, settingsPage{
+		AppConfig:   config,
+		RedirectURL: "http://127.0.0.1:" + config.Port + "/settings",
+	})
+}
+
+func validateSettings(cfg AppConfig) error {
+	err := validatePort(cfg.Port)
+	if err != nil {
+		return err
+	}
+	if cfg.SecretToken == "" {
+		return fmt.Errorf("Secret token is required")
+	}
+	if len(cfg.SecretToken) > 256 {
+		return fmt.Errorf("Secret token must be 256 characters or fewer")
+	}
+	return nil
 }
 
 func setSecurityHeaders(w http.ResponseWriter) {
@@ -563,12 +549,6 @@ func requestHeaderMatchesHost(rawURL, host string) bool {
 	return strings.EqualFold(parsed.Host, host)
 }
 
-func checkCurrentSettingsToken(r *http.Request) bool {
-	expected := []byte(config.SecretToken)
-	actual := []byte(r.FormValue("current_secret_token"))
-	return len(expected) == len(actual) && subtle.ConstantTimeCompare(expected, actual) == 1
-}
-
 func errorString(err error) string {
 	if err == nil {
 		return ""
@@ -576,22 +556,39 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+// settingsPage is the data for settingsTemplate. When RedirectURL is set, the page
+// shows "Port changed" and sends the browser to the new port instead of the form.
+type settingsPage struct {
+	AppConfig
+	RedirectURL string
+}
+
 var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+{{if .RedirectURL}}<meta http-equiv="refresh" content="1;url={{.RedirectURL}}">{{end}}
 <title>Swift Print Settings</title>
 <style>
 body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:40px;color:#172033}
 main{max-width:520px;margin:0 auto;background:#fff;border:1px solid #dde3ee;border-radius:8px;padding:24px;box-shadow:0 8px 24px rgba(20,30,50,.08)}
 label{display:block;font-weight:700;margin-top:16px}
-input{width:100%;box-sizing:border-box;margin-top:6px;padding:10px;border:1px solid #c8d1df;border-radius:6px;font-size:14px}
+input,select,textarea{width:100%;box-sizing:border-box;margin-top:6px;padding:10px;border:1px solid #c8d1df;border-radius:6px;font-size:14px;font-family:inherit}
 button{margin-top:20px;padding:10px 14px;border:0;border-radius:6px;background:#1769c2;color:#fff;font-weight:700;cursor:pointer}
+button.secondary{margin-top:8px;background:#fff;color:#1769c2;border:1px solid #c8d1df}
+button:disabled{background:#91a4bd;cursor:not-allowed}
+hr{border:0;border-top:1px solid #dde3ee;margin:24px 0}
 .hint{font-size:13px;color:#5d6b80;margin-top:12px;line-height:1.4}
+.status{margin-top:12px;font-weight:700;min-height:1.2em}
+a{color:#1769c2}
 </style>
 </head>
 <body>
 <main>
+{{if .RedirectURL}}
+<h2>Port changed to {{.Port}}</h2>
+<p>Redirecting to <a href="{{.RedirectURL}}">{{.RedirectURL}}</a>&hellip;</p>
+{{else}}
 <h2>Swift Print Settings</h2>
 <form method="post">
 <input type="hidden" name="current_secret_token" value="{{.SecretToken}}">
@@ -601,7 +598,98 @@ button{margin-top:20px;padding:10px 14px;border:0;border-radius:6px;background:#
 <input name="port" value="{{.Port}}" required>
 <button type="submit">Save Settings</button>
 </form>
-<p class="hint">Restart Swift Print after changing the port. Keep this token private and use it as the X-API-KEY header for print requests.</p>
+<p class="hint">Keep this token private and use it as the X-API-KEY header for print requests.</p>
+<hr>
+<h3>Test Print</h3>
+<label for="printers">Printer</label>
+<select id="printers"></select>
+<button type="button" class="secondary" onclick="loadPrinters()">Refresh Printers</button>
+<label for="printText">Text to Print</label>
+<textarea id="printText" rows="4">Hello from Swift Print!</textarea>
+<button type="button" id="printButton" onclick="printNow()">Print Test Page</button>
+<div class="status" id="status"></div>
+<p class="hint">Tests use the saved settings. Save first if you changed the token.</p>
+<script>
+function apiKey() {
+	return document.querySelector("[name=current_secret_token]").value;
+}
+
+function setStatus(message, color) {
+	const el = document.getElementById("status");
+	el.textContent = message;
+	el.style.color = color || "#172033";
+}
+
+async function request(path, options) {
+	options = options || {};
+	const response = await fetch(path, {
+		...options,
+		headers: {"X-API-KEY": apiKey(), ...(options.headers || {})}
+	});
+	if (!response.ok) {
+		const text = (await response.text()).trim();
+		throw new Error(text || response.status + " " + response.statusText);
+	}
+	return response.json();
+}
+
+function textToBase64(text) {
+	let binary = "";
+	new TextEncoder().encode(text).forEach(b => { binary += String.fromCharCode(b); });
+	return btoa(binary);
+}
+
+async function loadPrinters() {
+	const select = document.getElementById("printers");
+	try {
+		const result = await request("/printers");
+		const printers = Array.isArray(result.printers) ? result.printers : [];
+		const previous = select.value;
+		select.innerHTML = "";
+		printers.forEach(name => {
+			const option = document.createElement("option");
+			option.value = name;
+			option.textContent = name;
+			select.appendChild(option);
+		});
+		if (printers.includes(previous)) select.value = previous;
+		if (!result.success) {
+			setStatus("Failed to load printers: " + result.error, "red");
+		} else {
+			setStatus(printers.length ? "Loaded " + printers.length + " printer(s)" : "No printers found", printers.length ? "green" : "red");
+		}
+	} catch (error) {
+		setStatus("Failed to load printers: " + error.message, "red");
+	}
+}
+
+async function printNow() {
+	const printer = document.getElementById("printers").value;
+	const text = document.getElementById("printText").value;
+	if (!printer) {
+		setStatus("Select a printer first", "red");
+		return;
+	}
+	const button = document.getElementById("printButton");
+	button.disabled = true;
+	setStatus("Printing...");
+	try {
+		const result = await request("/print", {
+			method: "POST",
+			headers: {"Content-Type": "application/json"},
+			body: JSON.stringify({printer: printer, data: textToBase64(text + "\n")})
+		});
+		setStatus(result.success ? "Print sent to " + printer : "Print failed: " + result.error, result.success ? "green" : "red");
+	} catch (error) {
+		setStatus("Print failed: " + error.message, "red");
+	} finally {
+		button.disabled = false;
+	}
+}
+
+loadPrinters();
+</script>
+{{end}}
 </main>
 </body>
 </html>`))
@@ -643,15 +731,44 @@ func openBrowser(url string) {
 // SERVER
 //////////////////////////////////////////////////////////////
 
-func startServer() {
-	http.HandleFunc("/", testHandler)
-	http.HandleFunc("/print", printHandler)
-	http.HandleFunc("/printers", printersHandler)
-	http.HandleFunc("/settings", settingsHandler)
+// currentServer is the HTTP server that is listening right now.
+var currentServer *http.Server
 
-	if err := http.ListenAndServe("127.0.0.1:"+config.Port, nil); err != nil {
-		fmt.Println("[SERVER]", err)
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", apiHandler("", false, testHandler))
+	mux.HandleFunc("/print", apiHandler(http.MethodPost, true, printHandler))
+	mux.HandleFunc("/printers", apiHandler(http.MethodGet, true, printersHandler))
+	mux.HandleFunc("/settings", settingsHandler)
+	return mux
+}
+
+// startServing serves on listener and stops the server that was running before.
+func startServing(listener net.Listener) {
+	previousServer := currentServer
+
+	newServer := &http.Server{Handler: newMux()}
+	currentServer = newServer
+	go func() {
+		err := newServer.Serve(listener)
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Println("[SERVER]", err)
+		}
+	}()
+
+	if previousServer != nil {
+		// Run in the background: Shutdown waits for the current request (the Save) to finish.
+		go previousServer.Shutdown(context.Background())
 	}
+}
+
+func startServer() {
+	listener, err := net.Listen("tcp", "127.0.0.1:"+config.Port)
+	if err != nil {
+		fmt.Println("[SERVER]", err)
+		return
+	}
+	startServing(listener)
 }
 
 //////////////////////////////////////////////////////////////
