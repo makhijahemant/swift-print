@@ -48,7 +48,7 @@ SolidCompression=yes
 CloseApplications=force
 
 OutputDir=..\dist
-OutputBaseFilename={#AppName} Setup
+OutputBaseFilename={#AppName} Installer
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
